@@ -6,6 +6,9 @@
 pip install -r requirements.txt
 ```
 
+For the supplied multi-million-row dataset, see [COLAB.md](COLAB.md) for the
+high-RAM Colab workflow and recommended first training run.
+
 ## Directory Structure
 
 Place the dataset at the expected path relative to this directory:
@@ -94,7 +97,13 @@ python src/main.py --data-dir ../../dataset --output-dir ../../output --top-k-wo
 1. **Preprocessing**: Unicode normalization, abbreviation expansion, punctuation removal, legal suffix stripping
 2. **Blocking** (3 strategies combined, per-country):
    - Word-level TF-IDF cosine on name+address (top-K)
-   - Character n-gram TF-IDF on name (catches typos/transliterations)
+   - Character n-gram TF-IDF on name and address (catches typos,
+     transliterations, and distinctively similar premises)
    - Token blocking on name (shared token overlap)
 3. **Feature Engineering**: 30+ string similarity features per pair (Levenshtein, Jaro-Winkler, Jaccard, cosine, char-ngram, number overlap, etc.)
-4. **Matching**: LightGBM classifier with auto-threshold tuning for F0.5
+4. **Matching**: validation-gated ensemble of class-balanced LightGBM, Extra
+   Trees, and a compact MLP neural matcher. Candidate pairs for one Source 1
+   entity remain together during cross-validation; model weights and the match
+   cutoff are selected from out-of-fold probabilities to maximize macro
+   entity-level F0.5, including singleton records. A secondary model receives
+   non-zero weight only if it beats the LightGBM-only baseline in this test.

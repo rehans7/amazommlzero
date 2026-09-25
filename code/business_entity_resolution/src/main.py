@@ -104,6 +104,8 @@ def main():
                         help="Top-K for word TF-IDF blocking")
     parser.add_argument("--top-k-char", type=int, default=30,
                         help="Top-K for char n-gram TF-IDF blocking")
+    parser.add_argument("--top-k-addr-char", type=int, default=20,
+                        help="Top-K for address char n-gram TF-IDF blocking")
     parser.add_argument("--min-shared-tokens", type=int, default=2,
                         help="Min shared tokens for token blocking")
     parser.add_argument("--threshold", type=float, default=None,
@@ -159,6 +161,7 @@ def main():
             train_s1_split, train_s2, train_s3,
             top_k_word=args.top_k_word,
             top_k_char=args.top_k_char,
+            top_k_addr_char=args.top_k_addr_char,
             min_shared_tokens=args.min_shared_tokens,
         )
         train_recall = evaluate_blocking_recall(train_candidates, train_gt)
@@ -172,7 +175,8 @@ def main():
 
         # Train model
         model, threshold = train_randomized_model(
-            train_features, n_iter=args.search_iterations, n_splits=args.cv_folds
+            train_features, n_iter=args.search_iterations, n_splits=args.cv_folds,
+            all_s1_ids=list(train_s1_ids), ground_truth=train_gt,
         )
         if args.threshold is not None:
             threshold = args.threshold
@@ -183,6 +187,7 @@ def main():
             val_s1_split, train_s2, train_s3,
             top_k_word=args.top_k_word,
             top_k_char=args.top_k_char,
+            top_k_addr_char=args.top_k_addr_char,
             min_shared_tokens=args.min_shared_tokens,
         )
         val_recall = evaluate_blocking_recall(val_candidates, val_gt)
@@ -219,6 +224,7 @@ def main():
             train_s1, train_s2, train_s3,
             top_k_word=args.top_k_word,
             top_k_char=args.top_k_char,
+            top_k_addr_char=args.top_k_addr_char,
             min_shared_tokens=args.min_shared_tokens,
         )
         blocking_recall = evaluate_blocking_recall(train_candidates, ground_truth)
@@ -236,6 +242,8 @@ def main():
             model_path=model_path,
             n_iter=args.search_iterations,
             n_splits=args.cv_folds,
+            all_s1_ids=train_s1["entity_id"].tolist(),
+            ground_truth=ground_truth,
         )
 
     if args.threshold is not None:

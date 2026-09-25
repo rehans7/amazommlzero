@@ -1,0 +1,8 @@
+# Challenge data and generated submission artifacts are local-only.
+dataset/
+output/
+code/business_entity_resolution/models/
+
+# Python execution artifacts
+__pycache__/
+*.py[cod]

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 import logging
+from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,9 @@ def levenshtein_similarity(s1: str, s2: str) -> float:
         return 1.0
     if not s1 or not s2:
         return 0.0
-    dist = levenshtein_distance(s1, s2)
-    max_len = max(len(s1), len(s2))
-    return 1.0 - dist / max_len
+    # RapidFuzz provides the same edit-distance feature in optimized native
+    # code. This matters when scoring tens of millions of blocked pairs.
+    return float(Levenshtein.normalized_similarity(s1, s2))
 
 
 def jaro_similarity(s1: str, s2: str) -> float:
@@ -95,14 +96,11 @@ def jaro_similarity(s1: str, s2: str) -> float:
 
 def jaro_winkler_similarity(s1: str, s2: str, p: float = 0.1) -> float:
     """Compute Jaro-Winkler similarity."""
-    jaro = jaro_similarity(s1, s2)
-    prefix_len = 0
-    for i in range(min(4, min(len(s1), len(s2)))):
-        if s1[i] == s2[i]:
-            prefix_len += 1
-        else:
-            break
-    return jaro + prefix_len * p * (1 - jaro)
+    if not s1 and not s2:
+        return 1.0
+    if not s1 or not s2:
+        return 0.0
+    return float(JaroWinkler.similarity(s1, s2, prefix_weight=p))
 
 
 def jaccard_similarity(s1: str, s2: str) -> float:
@@ -249,6 +247,8 @@ def compute_pair_features(row_s1: pd.Series, row_s2s3: pd.Series) -> dict:
     features["addr_cosine"] = cosine_similarity_tokens(addr1, addr2)
     features["addr_char3gram"] = char_ngram_jaccard(addr1, addr2, 3)
     features["addr_number_overlap"] = number_overlap(addr1, addr2)
+    nums1, nums2 = _extract_numbers(addr1), _extract_numbers(addr2)
+    features["addr_has_conflicting_numbers"] = float(bool(nums1 and nums2 and not (nums1 & nums2)))
     features["addr_sorted_jw"] = sorted_token_similarity(addr1, addr2)
     features["addr_len_ratio"] = (
         min(len(addr1), len(addr2)) / max(len(addr1), len(addr2))
@@ -264,6 +264,7 @@ def compute_pair_features(row_s1: pd.Series, row_s2s3: pd.Series) -> dict:
     features["both_empty_addr"] = 1.0 if (not addr1.strip() and not addr2.strip()) else 0.0
     features["one_empty_addr"] = 1.0 if (bool(addr1.strip()) != bool(addr2.strip())) else 0.0
     features["name_exact_match"] = 1.0 if name1 == name2 and name1 else 0.0
+    features["candidate_is_source2"] = float(str(row_s2s3.get("entity_id", "")).startswith("S2-"))
 
     return features
 

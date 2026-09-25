@@ -12,7 +12,6 @@ The goal: high recall (capture all true matches) with reasonable reduction ratio
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
-from scipy.sparse import vstack
 from collections import defaultdict
 import logging
 
@@ -36,48 +35,77 @@ def _build_tfidf_candidates(
     """
     logger.info(f"Building TF-IDF candidates (analyzer={analyzer}, ngrams={ngram_range}, top_k={top_k})...")
 
-    all_texts = pd.concat([s1_df[text_col], s2s3_df[text_col]], ignore_index=True)
+    empty_result = {s1_id: [] for s1_id in s1_df["entity_id"].values}
+    target_texts = s2s3_df[text_col].fillna("")
+    if target_texts.str.strip().eq("").all():
+        logger.info("  Skipping TF-IDF pass because %s is empty for this country", text_col)
+        return empty_result
 
     vectorizer = TfidfVectorizer(
         analyzer=analyzer,
         ngram_range=ngram_range,
-        max_features=100000,
+        max_features=250000,
         sublinear_tf=True,
         min_df=1,
         max_df=0.95,
     )
-    tfidf_matrix = vectorizer.fit_transform(all_texts)
-
-    s1_vectors = tfidf_matrix[: len(s1_df)]
-    s2s3_vectors = tfidf_matrix[len(s1_df):]
+    try:
+        # Fit only on the much larger retrieval corpus.  This avoids keeping a
+        # second copy of millions of Source 1 texts in the vectorizer and gives
+        # the same vocabulary to every streamed S1 batch.
+        s2s3_vectors = vectorizer.fit_transform(target_texts)
+    except ValueError as error:
+        # Very small country partitions can legitimately have no vocabulary once
+        # document-frequency filtering is applied.  Another blocking pass can
+        # still retrieve candidates, so this must not abort the entire run.
+        logger.info("  Skipping TF-IDF pass for %s: %s", text_col, error)
+        return empty_result
 
     s1_ids = s1_df["entity_id"].values
     s2s3_ids = s2s3_df["entity_id"].values
 
     candidates = {}
 
-    # Process in batches to avoid memory issues
-    batch_size = 500
+    # ``sparse_dot_topn`` computes only the requested top values.  The former
+    # implementation materialized a dense (batch_size x target_records) array,
+    # which is infeasible for the supplied multi-million-record corpus.
+    try:
+        from sparse_dot_topn import sp_matmul_topn
+    except ImportError as error:
+        if len(s2s3_df) > 100_000:
+            raise ImportError(
+                "Install sparse-dot-topn (listed in requirements.txt) before "
+                "running blocking on a large dataset."
+            ) from error
+        sp_matmul_topn = None
+
+    target_transpose = s2s3_vectors.T.tocsr()
+    batch_size = 25_000
     for start in range(0, len(s1_df), batch_size):
         end = min(start + batch_size, len(s1_df))
-        batch_vectors = s1_vectors[start:end]
-
-        # Cosine similarity (vectors are already L2-normalized by TF-IDF)
-        sim_matrix = (batch_vectors @ s2s3_vectors.T).toarray()
+        batch_vectors = vectorizer.transform(s1_df[text_col].iloc[start:end].fillna(""))
+        if sp_matmul_topn is not None:
+            sim_matrix = sp_matmul_topn(
+                batch_vectors, target_transpose, top_n=top_k,
+                threshold=min_score, sort=True,
+            )
+        else:
+            # Small-data fallback for local smoke tests; still avoid densifying.
+            sim_matrix = (batch_vectors @ target_transpose).tocsr()
 
         for i in range(end - start):
-            scores = sim_matrix[i]
-            # Get top-k indices
-            if top_k < len(scores):
-                top_indices = np.argpartition(scores, -top_k)[-top_k:]
-            else:
-                top_indices = np.arange(len(scores))
+            row_start, row_end = sim_matrix.indptr[i], sim_matrix.indptr[i + 1]
+            top_indices = sim_matrix.indices[row_start:row_end]
+            scores = sim_matrix.data[row_start:row_end]
+            if sp_matmul_topn is None and len(scores) > top_k:
+                keep = np.argpartition(scores, -top_k)[-top_k:]
+                top_indices, scores = top_indices[keep], scores[keep]
 
             s1_id = s1_ids[start + i]
             cands = []
-            for idx in top_indices:
-                if scores[idx] >= min_score:
-                    cands.append((s2s3_ids[idx], float(scores[idx])))
+            for idx, score in zip(top_indices, scores):
+                if score >= min_score:
+                    cands.append((s2s3_ids[idx], float(score)))
             candidates[s1_id] = cands
 
     logger.info(f"  TF-IDF ({analyzer}) generated candidates for {len(candidates)} S1 entities")
@@ -87,13 +115,14 @@ def _build_tfidf_candidates(
 def _build_char_ngram_candidates(
     s1_df: pd.DataFrame,
     s2s3_df: pd.DataFrame,
+    text_col: str = "name_norm",
     top_k: int = 30,
     min_score: float = 0.1,
 ) -> dict:
     """Character n-gram TF-IDF for catching typos and transliterations."""
     return _build_tfidf_candidates(
         s1_df, s2s3_df,
-        text_col="name_norm",
+        text_col=text_col,
         top_k=top_k,
         ngram_range=(2, 4),
         analyzer="char_wb",
@@ -154,6 +183,7 @@ def generate_candidates(
     s3_df: pd.DataFrame,
     top_k_word: int = 50,
     top_k_char: int = 30,
+    top_k_addr_char: int = 20,
     min_shared_tokens: int = 2,
 ) -> dict:
     """
@@ -206,6 +236,21 @@ def generate_candidates(
         for s1_id, cands in char_cands.items():
             for cid, _ in cands:
                 all_candidates[s1_id].add(cid)
+
+        # Names can be missing, generic, or trade names.  An independent fuzzy
+        # address retrieval pass recovers otherwise invisible matches such as a
+        # renamed branch at the same distinctive premises.  It is deliberately
+        # only a candidate generator; the classifier still decides the match.
+        if top_k_addr_char > 0:
+            addr_char_cands = _build_char_ngram_candidates(
+                s1_country, s2s3_country,
+                text_col="addr_norm",
+                top_k=top_k_addr_char,
+                min_score=0.12,
+            )
+            for s1_id, cands in addr_char_cands.items():
+                for cid, _ in cands:
+                    all_candidates[s1_id].add(cid)
 
         # Strategy 3: Token blocking on name
         tok_cands = _build_token_blocking_candidates(
